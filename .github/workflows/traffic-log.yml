@@ -1,0 +1,94 @@
+name: Traffic Log
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch traffic & post comment
+        env:
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE_TITLE: "Traffic Log"
+        run: |
+          set -e
+
+          clones_json=$(gh api "repos/${REPO}/traffic/clones")
+          views_json=$(gh api "repos/${REPO}/traffic/views")
+
+          date_utc=$(date -u +%F)
+
+          clones_today=$(echo "$clones_json" | jq --arg d "$date_utc" '[.clones[] | select(.timestamp | startswith($d)) | .count] | first // 0')
+          uniques_today=$(echo "$clones_json" | jq --arg d "$date_utc" '[.clones[] | select(.timestamp | startswith($d)) | .uniques] | first // 0')
+          views_today=$(echo "$views_json" | jq --arg d "$date_utc" '[.views[] | select(.timestamp | startswith($d)) | .count] | first // 0')
+          view_uniques_today=$(echo "$views_json" | jq --arg d "$date_utc" '[.views[] | select(.timestamp | startswith($d)) | .uniques] | first // 0')
+
+          clones_14d=$(echo "$clones_json" | jq '.count')
+          clone_uniques_14d=$(echo "$clones_json" | jq '.uniques')
+          views_14d=$(echo "$views_json" | jq '.count')
+          view_uniques_14d=$(echo "$views_json" | jq '.uniques')
+
+          issue_number=$(gh issue list --repo "$REPO" --search "$ISSUE_TITLE in:title" --state open --json number,title --jq ".[] | select(.title==\"$ISSUE_TITLE\") | .number" | head -n1)
+
+          is_first_run=false
+          if [ -z "$issue_number" ]; then
+            is_first_run=true
+            clones_by_day=$(echo "$clones_json" | jq '.clones')
+            views_by_day=$(echo "$views_json" | jq '.views')
+
+            baseline_file=$(mktemp)
+            {
+              echo "# Traffic Log"
+              echo ""
+              echo "Daily snapshots, auto-updated by \`.github/workflows/traffic-log.yml\`."
+              echo ""
+              echo "## Baseline (last 14 days, $date_utc)"
+              echo ""
+              echo "| Metric | Total | Unique |"
+              echo "|---|---|---|"
+              echo "| Clones | $clones_14d | $clone_uniques_14d |"
+              echo "| Views | $views_14d | $view_uniques_14d |"
+              echo ""
+              echo "### Clones by day"
+              echo '```json'
+              echo "$clones_by_day"
+              echo '```'
+              echo ""
+              echo "### Views by day"
+              echo '```json'
+              echo "$views_by_day"
+              echo '```'
+            } > "$baseline_file"
+
+            issue_url=$(gh issue create --repo "$REPO" --title "$ISSUE_TITLE" --body-file "$baseline_file")
+            issue_number=$(echo "$issue_url" | grep -oE '[0-9]+$')
+            echo "Created issue #$issue_number with baseline"
+          fi
+
+          if [ "$is_first_run" = "false" ] && [ "$clones_today" = "0" ] && [ "$views_today" = "0" ]; then
+            echo "No activity today. Skipping comment."
+            exit 0
+          fi
+
+          if [ "$is_first_run" = "false" ]; then
+            comment_file=$(mktemp)
+            {
+              echo "**$date_utc**"
+              echo ""
+              echo "| Metric | Today | 14d total |"
+              echo "|---|---|---|"
+              echo "| Clones | $clones_today (unique: $uniques_today) | $clones_14d |"
+              echo "| Views | $views_today (unique: $view_uniques_today) | $views_14d |"
+            } > "$comment_file"
+
+            gh issue comment "$issue_number" --repo "$REPO" --body-file "$comment_file"
+            echo "Posted comment to issue #$issue_number"
+          fi
