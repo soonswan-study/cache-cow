@@ -74,23 +74,39 @@ Additionally, when Claude reads a very large file (1000+ lines), it consumes a m
 
 ### Solution
 
-This hook intercepts every `Read` tool call and applies three layers of protection:
+This hook intercepts every `Read` tool call and applies four layers of protection:
 
-#### Layer 1: Large File Blocking
+#### Layer 1: Large File Blocking (full reads only)
 
-Files exceeding 1000 lines are blocked entirely. Claude must specify `offset` and `limit` to read only the section it needs.
+Files exceeding 1000 lines are blocked for **full reads**. Claude must specify `offset` and `limit` to read only the section it needs. Partial reads with `offset`/`limit` bypass this check regardless of file size.
 
 ```bash
-LINE_COUNT=$(wc -l < "$FILE_PATH")
-if [[ "$LINE_COUNT" -gt 1000 ]]; then
-  echo "This file has ${LINE_COUNT} lines. Use offset/limit to read only the section you need."
+if [[ "$IS_PARTIAL" == "false" ]]; then
+  LINE_COUNT=$(wc -l < "$FILE_PATH")
+  if [[ "$LINE_COUNT" -gt 1000 ]]; then
+    echo "This file has ${LINE_COUNT} lines. Use offset/limit to read only the section you need."
+    exit 2  # Block the read
+  fi
+fi
+```
+
+#### Layer 2: Partial Read Range Cache
+
+When `offset` or `limit` is specified, the hook checks if the requested line range has already been read and the file hasn't changed since. If the range is covered, the read is blocked.
+
+Read ranges are stored as a merged union in `{cache_key}.ranges`. For example, after reading lines 1-50 and then 51-100, the ranges file contains `1 100` (merged). A subsequent request for lines 20-70 is detected as already covered.
+
+```bash
+# If requested range [START, END] is covered by an existing range:
+if [[ "$rs" -le "$START" && "$re" -ge "$END" ]]; then
+  echo "Range already read (lines ${START}-${END}): $FILE_PATH"
   exit 2  # Block the read
 fi
 ```
 
-#### Layer 2: Cache Hit (Unchanged File)
+#### Layer 3: Cache Hit (Unchanged File, full reads)
 
-If the file has been read before and hasn't changed since, the read is blocked entirely with a message telling Claude to use the content it already has.
+If the file has been fully read before and hasn't changed since, the read is blocked entirely.
 
 ```bash
 if diff -q "$CACHE_FILE" "$FILE_PATH" > /dev/null 2>&1; then
@@ -99,37 +115,36 @@ if diff -q "$CACHE_FILE" "$FILE_PATH" > /dev/null 2>&1; then
 fi
 ```
 
-#### Layer 3: Diff-Only Return (Changed File)
+#### Layer 4: Diff-Only Return (Changed File)
 
-If the file has been read before but has changed (e.g., after an edit), only the diff is returned instead of the full file content.
+If the file has been read before but has changed (e.g., after an edit), only the diff is returned instead of the full file content. The read is then allowed so Claude gets the current content.
 
 ```bash
 diff --unified=3 "$CACHE_FILE" "$FILE_PATH"
 cp "$FILE_PATH" "$CACHE_FILE"  # Update cache
-exit 2  # Return diff instead of full read
+exit 0  # Allow the read (post-file-cache will update ranges)
 ```
-
-#### Bypass Conditions
-
-The hook does NOT intercept when:
-- `offset` or `limit` is specified (partial read, already targeted)
-- The file is binary or generated (`.png`, `.lock`, `.min.js`, etc.)
-- The file has never been read before (first read always passes through)
 
 ### Result
 
-**Case 1: Large file blocked**
+**Case 1: Large file blocked (full read)**
 ```
 This file has 2847 lines. Use offset/limit to read only the section you need.
 ```
 
-**Case 2: Cache hit (file unchanged)**
+**Case 2: Partial range already read**
+```
+Range already read (lines 1-50): /project/src/auth/service.ts
+No changes since last read. Work with the content you already have.
+```
+
+**Case 3: Cache hit (full read, file unchanged)**
 ```
 File unchanged (re-read unnecessary): /project/src/auth/service.ts
 No changes since last read. Work with the content you already have.
 ```
 
-**Case 3: File changed since last read**
+**Case 4: File changed since last read**
 ```
 Showing only changes since last read: /project/src/auth/service.ts
 ---
@@ -145,6 +160,7 @@ Above diff shows changes since your last read.
 Log output:
 ```
 [14:31:15] pre-read: blocked large file service.ts (2847 lines)
+[14:31:20] pre-read: partial range cache hit (service.ts 1-50)
 [14:31:22] pre-read: cache hit, blocked re-read (service.ts)
 [14:32:01] pre-read: change detected, returning diff (service.ts)
 ```
@@ -163,33 +179,44 @@ The `pre-read.sh` hook needs a cached copy of each file to compare against. With
 
 This hook runs after every `Read`, `Edit`, or `Write` tool call:
 
-#### On Read (full file only)
+#### On Full Read
 
-Saves a snapshot of the file to the session-scoped cache directory. Partial reads (with `offset`/`limit`) are skipped since they don't represent the full file.
+Saves the file to the session cache and records the full range (`1 N`) in `.ranges`. Deletes any `.snapshot` left from prior partial reads (since the full cache is now authoritative).
 
 ```bash
-# Full read: cache the file
 cp "$FILE_PATH" "$CACHE_FILE"
+echo "1 $TOTAL" > "$RANGES_FILE"
+rm -f "$SNAPSHOT_FILE"
+```
+
+#### On Partial Read (offset/limit specified)
+
+Saves a snapshot of the file (diff baseline) and appends the read range to `.ranges`. Ranges are then merged so `[1-50] + [51-100]` becomes `[1-100]`.
+
+```bash
+cp "$FILE_PATH" "$SNAPSHOT_FILE"
+echo "$START $END" >> "$RANGES_FILE"
+_merge_ranges "$RANGES_FILE"  # sort + awk union merge
 ```
 
 #### On Edit/Write
 
-Updates the existing cache entry so it matches the new file state. Only updates if a cache entry already exists (doesn't create new entries on write).
+Updates the full cache (if it exists) and **deletes** `.snapshot` and `.ranges` so the next partial read is treated as fresh.
 
 ```bash
-if [[ "$IS_WRITE" == "true" ]]; then
-  if [[ -f "$CACHE_FILE" ]]; then
-    cp "$FILE_PATH" "$CACHE_FILE"  # Update existing cache
-  fi
-fi
+if [[ -f "$CACHE_FILE" ]]; then cp "$FILE_PATH" "$CACHE_FILE"; fi
+rm -f "$CACHE_DIR/${CACHE_KEY}.snapshot" "$CACHE_DIR/${CACHE_KEY}.ranges"
 ```
 
-#### Cache Key
+#### Cache Structure
 
-Each file path is hashed (md5) to create a flat cache directory structure:
+Each file path is hashed (md5) to create a flat cache directory:
 
 ```
-/tmp/claude-read-cache/{session_id}/{md5_of_filepath}
+/tmp/claude-read-cache/{session_id}/
+  {md5}           ← full read snapshot (pre-read diff base)
+  {md5}.snapshot  ← partial read snapshot (diff base)
+  {md5}.ranges    ← merged read ranges: "1 50\n80 120" (sorted, non-overlapping)
 ```
 
 ### Result
@@ -197,8 +224,9 @@ Each file path is hashed (md5) to create a flat cache directory structure:
 The hook is silent to Claude (no stdout output). It only writes to the log:
 
 ```
-[14:31:10] post-file-cache: cached (service.ts)
-[14:32:05] post-file-cache: cache updated (service.ts)
+[14:31:10] post-file-cache: full read cached (service.ts)
+[14:31:18] post-file-cache: partial range cached+merged (service.ts 1-50)
+[14:32:05] post-file-cache: cache updated + ranges invalidated (service.ts)
 ```
 
 ---

@@ -22,6 +22,15 @@ osascript -e "display notification \"${CACHE_MSG}\" with title \"Claude Code\" s
 find "$CACHE_BASE" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 find /tmp/claude-hook-cache -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null || true
 
+# ── Auto-start cache-proxy (1h TTL upgrade) if installed ──
+if [[ -f "$HOME/.claude/cache-proxy/proxy.js" ]]; then
+  if ! lsof -ti:18080 >/dev/null 2>&1; then
+    node "$HOME/.claude/cache-proxy/proxy.js" >> "$HOME/.claude/cache-proxy/proxy.log" 2>&1 &
+    echo "[SessionStart] cache-proxy started (port 18080)"
+    echo "[$(date +%H:%M:%S)] session-start: cache-proxy started" >> "$LOG"
+  fi
+fi
+
 echo ""
 echo "[Reminder] Do not re-query git status or project structure injected at session start."
 

@@ -18,8 +18,8 @@ Claude Code consumes tokens every time it reads a file, runs a test, or checks l
 | Hook | Event | What it does |
 |---|---|---|
 | `session-start.sh` | SessionStart | Clears read cache, cleans up stale caches (>7 days) |
-| `pre-read.sh` | PreToolUse (Read) | Blocks re-reads of unchanged files (returns cache hit). Shows diff-only for changed files. Blocks files >1000 lines without offset/limit |
-| `post-file-cache.sh` | PostToolUse (Read/Edit/Write) | Caches file contents after reads, updates cache after writes |
+| `pre-read.sh` | PreToolUse (Read) | Blocks re-reads of unchanged files (diff-only for changed). Blocks files >1000 lines (full reads only). Blocks repeated partial reads (offset/limit) of already-read ranges |
+| `post-file-cache.sh` | PostToolUse (Read/Edit/Write) | Caches full reads; tracks partial read ranges with merge; invalidates ranges on Edit/Write |
 | `pre-bash.sh` | PreToolUse (Bash) | Filters test output to essentials (start, failures, summary). Limits log commands to `tail -100` |
 | `pre-bash.helper.filter.sh` | (helper) | awk filter for pytest, jest, Django test, vitest output |
 | `post-compact.sh` | PostCompact | Clears all caches after context compaction |
@@ -131,7 +131,7 @@ Hooks are updated immediately for new sessions.
 
 ### Large File Threshold
 
-The default threshold for blocking large file reads is **1000 lines**. To change it, edit `hooks/pre-read.sh`:
+The default threshold for blocking large file reads is **1000 lines**. This only applies to **full reads** (no `offset`/`limit`). Partial reads with `offset`/`limit` are always allowed regardless of file size. To change it, edit `hooks/pre-read.sh`:
 
 ```bash
 # Change 1000 to your preferred threshold
